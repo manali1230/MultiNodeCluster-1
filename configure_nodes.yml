@@ -1,0 +1,125 @@
+- hosts: tag_os_master,tag_os_worker
+  tasks:
+
+  - name: Add k8s repository
+    yum_repository:
+      name: kubernetes
+      description: Kubernetes
+      baseurl: https://packages.cloud.google.com/yum/repos/kubernetes-el7-\$basearch
+      enabled: yes
+      gpgcheck: yes
+      repo_gpgcheck: yes
+      gpgkey: https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+      exclude:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+  - name: install Docker
+    package:
+      name: "{{  item }}"
+      state: present
+    with_items:
+      - docker
+      - iproute-tc   
+       
+  - name: Install Kubeadm
+    yum:
+      name: kubeadm
+      disable_excludes: kubernetes
+      state: present
+
+  - name: start docker service
+    service:
+      name: "{{  item  }}"
+      state: started
+      enabled: yes
+    with_items:
+      - docker
+      - kubelet
+
+  - name: Change driver to systemd
+    copy:
+      dest: /etc/docker/daemon.json
+      content: '{
+                 "exec-opts": ["native.cgroupdriver=systemd"]
+                }'
+    
+  - name: restart docker
+    service:
+      name: docker
+      state: restarted
+
+- hosts: tag_os_master
+  tasks:
+  - name: download all images
+    command: kubeadm config images pull
+
+  - ansible.posix.sysctl:
+      name: "{{ item  }}"
+      value: '1'
+      sysctl_file: /etc/sysctl.d/k8s.conf
+      sysctl_set: yes
+      state: present
+      reload: yes
+    with_items:
+      - net.bridge.bridge-nf-call-ip6tables
+      - net.bridge.bridge-nf-call-iptables
+
+  - name: init kubeadm
+    command: kubeadm init --pod-network-cidr=10.240.0.0/16 --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem
+    ignore_errors: yes
+
+  - name: create a directory
+    file:
+      path: $HOME/.kube
+      state: directory
+
+  - name: Copy file with owner and permissions
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: $HOME/.kube/config 
+      remote_src: yes
+
+  - name: Change file ownership, group and permissions
+    file:
+      path: $HOME/.kube/config
+      owner: root
+      group: root
+
+  - name: Generate Token
+    command: kubeadm token create --print-join-command
+    register: token
+
+  - name: Token for Worker Node
+    debug:
+      msg: "{{ token.stdout }}" 
+
+  - name: Register dummy host with variable
+    add_host:
+      name: "DUMMY_HOST"
+      mastertoken: " {{ token.stdout }}"
+
+  - name: flannel
+    command: kubectl apply  -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+
+  - name: Cleaning Caches on RAM
+    shell: echo 3 > /proc/sys/vm/drop_caches
+
+- hosts: tag_os_worker
+  tasks:
+  - ansible.posix.sysctl:
+      name: "{{ item  }}"
+      value: '1'
+      sysctl_file: /etc/sysctl.d/k8s.conf
+      sysctl_set: yes
+      state: present
+      reload: yes
+    with_items:
+      - net.bridge.bridge-nf-call-ip6tables
+      - net.bridge.bridge-nf-call-iptables
+
+  - name: Join Worker with Master
+    command: "{{  hostvars['DUMMY_HOST']['mastertoken'] }}"
+    ignore_errors: yes
+
